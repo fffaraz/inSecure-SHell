@@ -5,3 +5,5 @@ CONFIG -= qt
 QMAKE_CFLAGS += "-std=gnu99"
 LIBS += -lutil
 SOURCES += main.c
+INCLUDEPATH += ../../s2n/api/
+QMAKE_LFLAGS += -L../../s2n/lib/ -L../../s2n/libcrypto-root/lib -ls2n -lpthread -ldl -lrt -lcrypto
