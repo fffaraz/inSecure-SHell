@@ -19,6 +19,8 @@
 #include <termios.h>
 #include <unistd.h>
 
+#include <s2n.h>
+
 #define PORT   "5910"
 #define BUFFERSIZE 64 * 1024
 
