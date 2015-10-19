@@ -19,10 +19,7 @@
 #include <termios.h>
 #include <unistd.h>
 
-#include <errno.h>
-
 #define PORT   "5910"
-#define SECRET "<cs591secret>"
 #define BUFFERSIZE 64 * 1024
 
 static char certificate[] =
@@ -86,6 +83,8 @@ static char dhparams[] =
     "HI5CnYmkAwJ6+FSWGaZQDi8bgerFk9RWwwIBAg==\n"
     "-----END DH PARAMETERS-----\n";
 
+struct s2n_config *config;
+
 void sigchld_handler(int s)
 {
     (void) s;
@@ -101,106 +100,106 @@ void *get_in_addr(struct sockaddr *sa) // get sockaddr, IPv4 or IPv6:
 
 void handle_client(int sockfd)
 {
-    const char *hello_msg = "<rembash2>\n";
-    int hello_len = strlen(hello_msg);
-    int bytes_sent = send(sockfd, hello_msg, hello_len, 0);
-    if(bytes_sent == -1 || bytes_sent != hello_len)
-    {
-        perror("send hello_msg");
-        return;
+    struct s2n_connection *conn = s2n_connection_new(S2N_SERVER);
+    s2n_connection_set_config(conn, config);
+    s2n_connection_set_fd(conn, sockfd);
+
+    s2n_blocked_status blocked;
+    do {
+        if (s2n_negotiate(conn, &blocked) < 0) {
+            fprintf(stderr, "Failed to negotiate: '%s' %d\n", s2n_strerror(s2n_errno, "EN"), s2n_connection_get_alert(conn));
+            exit(1);
+        }
+    } while (blocked);
+
+    int client_hello_version;
+    int client_protocol_version;
+    int server_protocol_version;
+    int actual_protocol_version;
+
+    if ((client_hello_version = s2n_connection_get_client_hello_version(conn)) < 0) {
+        fprintf(stderr, "Could not get client hello version\n");
+        exit(1);
+    }
+    if ((client_protocol_version = s2n_connection_get_client_protocol_version(conn)) < 0) {
+        fprintf(stderr, "Could not get client protocol version\n");
+        exit(1);
+    }
+    if ((server_protocol_version = s2n_connection_get_server_protocol_version(conn)) < 0) {
+        fprintf(stderr, "Could not get server protocol version\n");
+        exit(1);
+    }
+    if ((actual_protocol_version = s2n_connection_get_actual_protocol_version(conn)) < 0) {
+        fprintf(stderr, "Could not get actual protocol version\n");
+        exit(1);
+    }
+    printf("Client hello version: %d\n", client_hello_version);
+    printf("Client protocol version: %d\n", client_protocol_version);
+    printf("Server protocol version: %d\n", server_protocol_version);
+    printf("Actual protocol version: %d\n", actual_protocol_version);
+
+    if (s2n_get_server_name(conn)) {
+        printf("Server name: %s\n", s2n_get_server_name(conn));
+    }
+    if (s2n_get_application_protocol(conn)) {
+        printf("Application protocol: %s\n", s2n_get_application_protocol(conn));
     }
 
-    char shared_key[256];
-    int nbytes = recv(sockfd, shared_key, 255, 0); // it's not 100% guaranteed to work! must use readline.
-    shared_key[nbytes - 1] = '\0';
-    printf("Received %s from [%d]\n", shared_key, sockfd);
-
-    if(strcmp(shared_key, SECRET) != 0)
-    {
-        printf("Shared key check failed for [%d]\n", sockfd);
-        return;
+    uint32_t length;
+    const uint8_t *status = s2n_connection_get_ocsp_response(conn, &length);
+    if (status && length > 0) {
+        fprintf(stderr, "OCSP response received, length %d\n", length);
     }
 
-    const char *ok_msg = "<ok>\n";
-    send(sockfd, ok_msg, strlen(ok_msg), 0);
-
-    /*
-    dup2(sockfd, STDIN_FILENO);
-    dup2(sockfd, STDOUT_FILENO);
-    dup2(sockfd, STDERR_FILENO);
-    */
+    printf("Cipher negotiated: %s\n", s2n_connection_get_cipher(conn));
 
     int master;
     pid_t pid;
 
     signal(SIGCHLD, SIG_IGN);
     pid = forkpty(&master, NULL, NULL, NULL);
-
-    if(pid < 0)
-    {
-        const char *error_msg = "forkpty failed\n";
-        perror(error_msg);
-        send(sockfd, error_msg, strlen(error_msg), 0);
-        return;
-    }
-
     if(pid == 0) // child
     {
-        //execl("/bin/bash", "bash", "--noediting", "-i", NULL);
         execl("/bin/bash", "bash", NULL);
     }
     else
     {
-        const char *ready_msg = "<ready>\n";
-        send(sockfd, ready_msg, strlen(ready_msg), 0);
-
-        /*
-        // remove the echo
-        struct termios tios;
-        tcgetattr(master, &tios);
-        tios.c_lflag &= ~(ECHO | ECHONL);
-        tcsetattr(master, TCSAFLUSH, &tios);
-        */
-
         int maxfd = master > sockfd ? master : sockfd;
-
         for(;;)
         {
             char buf[BUFFERSIZE];
-
+            int bytes_read, bytes_written;
             fd_set readfds;
             FD_ZERO(&readfds);
             FD_SET(master, &readfds);
             FD_SET(sockfd, &readfds);
-
-            if(select(maxfd + 1, &readfds, NULL, NULL, NULL) == -1)
-            {
-                perror("select");
-                return;
-            }
-
+            select(maxfd + 1, &readfds, NULL, NULL, NULL);
             if(FD_ISSET(master, &readfds))
             {
-                nbytes = read(master, buf, BUFFERSIZE);
-                if(nbytes < 1)
+                bytes_read = read(master, buf, BUFFERSIZE);
+                if(bytes_read < 1) break;
+                char *buf_ptr = buf;
+                int bytes_available = bytes_read;
+                do
                 {
-                    //perror("master closed");
-                    break;
-                }
-                send(sockfd, buf, nbytes, 0);
+                    bytes_written = s2n_send(conn, buf_ptr, bytes_available, &blocked);
+                    if(bytes_written < 0) break;
+                    bytes_available -= bytes_written;
+                    buf_ptr += bytes_written;
+                } while(bytes_available || blocked);
             }
-
             if(FD_ISSET(sockfd, &readfds))
             {
-                nbytes = recv(sockfd, buf, BUFFERSIZE, 0);
-                if(nbytes < 1)
+                do
                 {
-                    //perror("sockfd closed");
-                    break;
-                }
-                write(master, buf, nbytes);
+                    bytes_read = s2n_recv(conn, buf, BUFFERSIZE, &blocked);
+                    if(bytes_read < 1) break;
+                    write(master, buf, bytes_read);
+                } while(blocked);
             }
         }
+        s2n_connection_wipe(conn);
+        s2n_connection_free(conn);
     }
 }
 
@@ -250,20 +249,19 @@ int main(void)
 #endif
 
     bind(sockfd, servinfo2->ai_addr, servinfo2->ai_addrlen);
-
     freeaddrinfo(servinfo); // all done with this structure
-
     listen(sockfd, 10);
 
-#if 1
+    s2n_init();
+    config = s2n_config_new();
+    s2n_config_add_cert_chain_and_key(config, certificate, private_key);
+    s2n_config_add_dhparams(config, dhparams);
+
     struct sigaction sa;
     sa.sa_handler = sigchld_handler; // reap all dead processes
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART;
     sigaction(SIGCHLD, &sa, NULL);
-#else
-    signal(SIGCHLD, SIG_IGN);
-#endif
 
     for(;;)
     {
@@ -287,6 +285,8 @@ int main(void)
 
         close(new_fd);  // parent doesn't need this
     }
+
+    s2n_cleanup();
 
     return 0;
 }
