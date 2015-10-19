@@ -15,28 +15,15 @@
 #include <termios.h>
 #include <unistd.h>
 
+#include <s2n.h>
+
 #define PORT   "5910"
-#define SECRET "<cs591secret>\n"
 #define BUFFERSIZE 64 * 1024
 
 struct termios saved_attributes;
 void reset_input_mode()
 {
     tcsetattr(STDIN_FILENO, TCSANOW, &saved_attributes);
-}
-
-void readline(int sockfd, char *buf)
-{
-    int pos = 0;
-    char c;
-    for(;;)
-    {
-        int n = recv(sockfd, &c, 1, 0);
-        if(n < 1) break;
-        buf[pos++] = c;
-        if(c == '\n') break;
-    }
-    buf[pos] = '\0';
 }
 
 void sigint_handler(int signum)
@@ -91,10 +78,10 @@ int main(int argc, char **argv)
     hints.ai_socktype = SOCK_STREAM;
 
     struct addrinfo *dnsres;
-    int status = getaddrinfo(argv[1], PORT, &hints, &dnsres);
-    if(status != 0)
+    int status_1 = getaddrinfo(argv[1], PORT, &hints, &dnsres);
+    if(status_1 != 0)
     {
-        fprintf(stderr, "dns lookup failed: %s\n", gai_strerror(status));
+        fprintf(stderr, "dns lookup failed: %s\n", gai_strerror(status_1));
         return 2;
     }
 
@@ -112,43 +99,73 @@ int main(int argc, char **argv)
 
     freeaddrinfo(dnsres); // frees the memory that was dynamically allocated for the linked lists by getaddrinfo
 
+    s2n_init();
+    
+    struct s2n_config *config = s2n_config_new();
+    s2n_status_request_type type = S2N_STATUS_REQUEST_NONE;
+    s2n_config_set_status_request_type(config, type);
+
+    struct s2n_connection *conn = s2n_connection_new(S2N_CLIENT);
+    s2n_connection_set_config(conn, config);
+    s2n_connection_set_fd(conn, sockfd);
+
+    s2n_blocked_status blocked;
+    do {
+        if (s2n_negotiate(conn, &blocked) < 0) {
+            fprintf(stderr, "Failed to negotiate: '%s' %d\n", s2n_strerror(s2n_errno, "EN"), s2n_connection_get_alert(conn));
+            exit(1);
+        }
+    } while (blocked);
+
+    int client_hello_version;
+    int client_protocol_version;
+    int server_protocol_version;
+    int actual_protocol_version;
+
+    if ((client_hello_version = s2n_connection_get_client_hello_version(conn)) < 0) {
+        fprintf(stderr, "Could not get client hello version\n");
+        exit(1);
+    }
+    if ((client_protocol_version = s2n_connection_get_client_protocol_version(conn)) < 0) {
+        fprintf(stderr, "Could not get client protocol version\n");
+        exit(1);
+    }
+    if ((server_protocol_version = s2n_connection_get_server_protocol_version(conn)) < 0) {
+        fprintf(stderr, "Could not get server protocol version\n");
+        exit(1);
+    }
+    if ((actual_protocol_version = s2n_connection_get_actual_protocol_version(conn)) < 0) {
+        fprintf(stderr, "Could not get actual protocol version\n");
+        exit(1);
+    }
+    printf("Client hello version: %d\n", client_hello_version);
+    printf("Client protocol version: %d\n", client_protocol_version);
+    printf("Server protocol version: %d\n", server_protocol_version);
+    printf("Actual protocol version: %d\n", actual_protocol_version);
+
+    if (s2n_get_server_name(conn)) {
+        printf("Server name: %s\n", s2n_get_server_name(conn));
+    }
+    if (s2n_get_application_protocol(conn)) {
+        printf("Application protocol: %s\n", s2n_get_application_protocol(conn));
+    }
+
+    uint32_t length;
+    const uint8_t *status = s2n_connection_get_ocsp_response(conn, &length);
+    if (status && length > 0) {
+        fprintf(stderr, "OCSP response received, length %d\n", length);
+    }
+
+    printf("Cipher negotiated: %s\n", s2n_connection_get_cipher(conn));
+
     char buf[BUFFERSIZE + 1];
-    int nbytes, mbytes;
-
-    readline(sockfd, buf);
-    printf("Received: %s", buf);
-
-    if(strcmp(buf, "<rembash2>\n") != 0)
-    {
-        fprintf(stderr, "protocol failed\n");
-        return 4;
-    }
-
-    send(sockfd, SECRET, strlen(SECRET), 0);
-
-    readline(sockfd, buf);
-    printf("Received: %s", buf);
-
-    if(strcmp(buf, "<ok>\n") != 0)
-    {
-        fprintf(stderr, "shared key failed\n");
-        return 5;
-    }
-
-    readline(sockfd, buf);
-    printf("Received: %s", buf);
-
-    if(strcmp(buf, "<ready>\n") != 0)
-    {
-        fprintf(stderr, "not ready!\n");
-        return 6;
-    }
+    int bytes_read, bytes_written;
 
     // Make sure stdin is a terminal.
     if (!isatty(STDIN_FILENO))
     {
-        fprintf (stderr, "Not a terminal.\n");
-        exit (EXIT_FAILURE);
+        fprintf(stderr, "Not a terminal.\n");
+        exit(EXIT_FAILURE);
     }
 
     // Save the terminal attributes so we can restore them later.
@@ -171,38 +188,37 @@ int main(int argc, char **argv)
     for(;;)
     {
         readfds = master;
-
-        if(select(sockfd + 1, &readfds, NULL, NULL, NULL) == -1)
-        {
-            perror("select");
-            return 7;
-        }
-
+        select(sockfd + 1, &readfds, NULL, NULL, NULL);
         if(FD_ISSET(STDIN_FILENO, &readfds))
         {
-            nbytes = read(STDIN_FILENO, buf, BUFFERSIZE);
-            if(nbytes < 1)
+            bytes_read = read(STDIN_FILENO, buf, BUFFERSIZE);
+            if(bytes_read < 1) break;
+            char *buf_ptr = buf;
+            int bytes_available = bytes_read;
+            do
             {
-                //perror("stdin closed");
-                break;
-            }
-            mbytes = send(sockfd, buf, nbytes, 0);
+                bytes_written = s2n_send(conn, buf_ptr, bytes_available, &blocked);
+                if(bytes_written < 0) break;
+                bytes_available -= bytes_written;
+                buf_ptr += bytes_written;
+            } while(bytes_available || blocked);
         }
-
         if(FD_ISSET(sockfd, &readfds))
         {
-            nbytes = recv(sockfd, buf, BUFFERSIZE, 0);
-            if(nbytes < 1)
+            do
             {
-                //perror("sockfd closed");
-                break;
-            }
-            mbytes = write(STDOUT_FILENO, buf, nbytes);
+                bytes_read = s2n_recv(conn, buf, BUFFERSIZE, &blocked);
+                if(bytes_read < 1) break;
+                write(STDOUT_FILENO, buf, bytes_read);
+            } while(blocked);
         }
-        if(nbytes != mbytes) printf("nbytes [%d] != mbytes [%d] \n", nbytes, mbytes);
+        //if(nbytes != mbytes) printf("nbytes [%d] != mbytes [%d] \n", nbytes, mbytes);
     }
 
     close(sockfd);
+    s2n_connection_free(conn);
+    s2n_config_free(config);
+    s2n_cleanup();
     printf("\nBYE!\n");
     return 0;
 }
