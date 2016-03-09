@@ -12,7 +12,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
-#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
 #include <sys/types.h>
@@ -81,10 +80,29 @@ int setnonblocking(int sfd)
     return 0;
 }
 
+void exchange_data(int fdin, int idx)
+{
+    int fdout = fdin == clients[idx].socket ? clients[idx].pty : clients[idx].socket;
+    int nbytes = read(fdin, buf, BUFFERSIZE);
+    printf("Received [%d] bytes from client [%d] on file [%d] \n", nbytes, idx, fdin);
+    if(nbytes < 1)
+    {
+        printf("Client [%d] disconnected.\n", idx);
+        close(clients[idx].socket);
+        close(clients[idx].pty);
+        kill(clients[idx].pid, SIGTERM);
+        clients[idx].isvalid = 0;
+        return;
+    }
+    int mbytes = write(fdout, buf, nbytes);
+    if(nbytes != mbytes) printf("nbytes [%d] != mbytes [%d] !!!\n", nbytes, mbytes);
+}
+
 int main(void)
 {
     memset(clients, 0, sizeof(Client) * MAXCLIENTS);
     signal(SIGCHLD, SIG_IGN);
+    //signal(SIGPIPE, ) // FIXME
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
@@ -124,7 +142,7 @@ int main(void)
 
     int efd = epoll_create1(0);
     struct epoll_event event;
-    event.events = EPOLLIN; // | EPOLLET;
+    event.events = EPOLLIN;
     event.data.fd = sockfd;
     epoll_ctl(efd, EPOLL_CTL_ADD, sockfd, &event);
 
@@ -167,7 +185,7 @@ int main(void)
                 ed.idx = idx;
                 EventUnion eu;
                 eu.d = ed;
-                event.events = EPOLLIN; // | EPOLLET;
+                event.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
                 event.data.u64 = eu.u64;
                 epoll_ctl(efd, EPOLL_CTL_ADD, ed.fd, &event);
 
@@ -206,6 +224,13 @@ int main(void)
                 {
                     // assert(eu.d.fd == clients[eu.d.idx].socket)
                     int nbytes = recv(eu.d.fd, buf, 255, 0); // it's not 100% guaranteed to work! must use readline.
+                    if(nbytes < 1)
+                    {
+                        printf("Client [%d] disconnected.\n", eu.d.idx);
+                        close(eu.d.fd);
+                        clients[eu.d.idx].isvalid = 0;
+                        continue;
+                    }
                     buf[nbytes - 1] = '\0';
                     printf("Received %s from [%d]\n", buf, eu.d.fd);
 
@@ -242,7 +267,7 @@ int main(void)
                         ed.idx = eu.d.idx;
                         EventUnion eu;
                         eu.d = ed;
-                        event.events = EPOLLIN; // | EPOLLET;
+                        event.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
                         event.data.u64 = eu.u64;
                         epoll_ctl(efd, EPOLL_CTL_ADD, ed.fd, &event);
                         const char ready_msg[] = "<ready>\n";
@@ -251,9 +276,7 @@ int main(void)
                 } // if(client->state == 0)
                 else // if(client->state == 1)
                 {
-                    int nbytes = read(eu.d.fd, buf, BUFFERSIZE);
-                    printf("Received [%d] bytes from client [%d] on file [%d] \n", nbytes, eu.d.idx, eu.d.fd);
-                    if(nbytes < 1)
+                    if((events[n].events & EPOLLERR) || (events[n].events & EPOLLHUP))
                     {
                         printf("Client [%d] disconnected.\n", eu.d.idx);
                         close(clients[eu.d.idx].socket);
@@ -262,10 +285,20 @@ int main(void)
                         clients[eu.d.idx].isvalid = 0;
                         continue;
                     }
-                    int mbytes;
-                    if(eu.d.fd == clients[eu.d.idx].socket) mbytes = write(clients[eu.d.idx].pty,    buf, nbytes);
-                    if(eu.d.fd == clients[eu.d.idx].pty)    mbytes = write(clients[eu.d.idx].socket, buf, nbytes);
-                    if(nbytes != mbytes) printf("nbytes [%d] != mbytes [%d] \n", nbytes, mbytes);
+                    else if(events[i].events & EPOLLIN)
+                    {
+                        int bytes_available = 0;
+                        ioctl(eu.d.fd, FIONREAD, &bytes_available);
+                        exchange_data(eu.d.fd, eu.d.idx);
+                    }
+                    else if(events[i].events & EPOLLOUT)
+                    {
+                        exchange_data(eu.d.fd == clients[eu.d.idx].socket ? clients[eu.d.idx].pty : clients[eu.d.idx].socket, eu.d.idx);
+                    }
+                    else
+                    {
+                        printf("Client [%d] ???.\n", eu.d.idx);
+                    }
                 }
             } // if(events[n].data.fd == sockfd)
         } // for(int n = 0; n < nfd; ++n)
