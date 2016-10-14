@@ -276,6 +276,7 @@ int main(void)
                 } // if(client->state == 0)
                 else // if(client->state == 1)
                 {
+                    // FIXME: EPOLLHUP or EPOLLRDHUP ?!!
                     if((events[n].events & EPOLLERR) || (events[n].events & EPOLLHUP))
                     {
                         printf("Client [%d] disconnected.\n", eu.d.idx);
